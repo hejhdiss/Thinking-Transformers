@@ -4,6 +4,7 @@ thinking_transformer.py
 Python wrapper around transformer.dll / transformer.so
 
 The C library exposes:
+  transformer_configure(vocab, embed, heads, ff, layers, seq, think, mem) -> int  [NEW]
   transformer_init(seed)
   transformer_save(path)
   transformer_load(path)
@@ -14,25 +15,33 @@ The C library exposes:
   transformer_embed_dim()  -> int
   transformer_max_seq()    -> int
   transformer_is_ready()   -> int
-  transformer_adam_step()  -> long long          [NEW]
-  transformer_cross_entropy_loss(tokens, seq_len, targets) -> float  [NEW]
-  transformer_zero_grad()                        [NEW]
-  transformer_backward(tokens, seq_len, targets, loss_out)  [NEW]
-  transformer_step(lr)                           [NEW]
+  transformer_param_count() -> int                    [NEW]
+  transformer_adam_step()  -> long long
+  transformer_cross_entropy_loss(tokens, seq_len, targets) -> float
+  transformer_zero_grad()
+  transformer_backward(tokens, seq_len, targets, loss_out)   [Full BPTT]
+  transformer_step(lr)
+
+Full BPTT
+---------
+  All think-steps × all transformer layers are now differentiable.
+  Activations are cached during forward; backward unrolls through the
+  full computation graph (think_steps × layers × attention + FF).
 
 Usage
 -----
-  from thinking_transformer import ThinkingTransformer
+  from thinking_transformer import ThinkingTransformer, TransformerConfig
 
-  model = ThinkingTransformer()
+  # Custom architecture
+  cfg = TransformerConfig(
+      vocab_size=128, embed_dim=64, num_heads=4,
+      ff_dim=128, num_layers=3, max_seq_len=48,
+      think_steps=2, memory_slots=8,
+  )
+  model = ThinkingTransformer(config=cfg)
   model.init(seed=42)
 
-  # ── Forward / generate (unchanged) ───────────────────────
-  logits   = model.forward([5, 12, 3])
-  tokens   = model.generate([5, 12], max_new_tokens=8)
-  result   = model.generate_with_thinking([5, 12])
-
-  # ── Training API (new) ───────────────────────────────────
+  # ── Training ──────────────────────────────────────────────
   loss = model.train_step(
       tokens=[5, 12, 3, 22],
       targets=[12, 3, 22, 7],
@@ -47,26 +56,72 @@ import os
 import platform
 import sys
 import numpy as np
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 
-# ── Locate the shared library ───────────────────────────────────────────────
+# ── Configuration dataclass ──────────────────────────────────────────────────
+
+@dataclass
+class TransformerConfig:
+    """
+    Runtime configuration for the Thinking Transformer.
+    All parameters can be tuned before model.init().
+    """
+    vocab_size:    int = 64
+    embed_dim:     int = 32
+    num_heads:     int = 4
+    ff_dim:        int = 64
+    num_layers:    int = 2
+    max_seq_len:   int = 32
+    think_steps:   int = 3
+    memory_slots:  int = 8
+
+    def validate(self):
+        if self.embed_dim % self.num_heads != 0:
+            raise ValueError(
+                f"embed_dim ({self.embed_dim}) must be divisible by "
+                f"num_heads ({self.num_heads})"
+            )
+        assert 4 <= self.vocab_size   <= 256,  "vocab_size out of range [4, 256]"
+        assert 4 <= self.embed_dim    <= 128,  "embed_dim out of range [4, 128]"
+        assert 1 <= self.num_heads    <= 8,    "num_heads out of range [1, 8]"
+        assert 4 <= self.ff_dim       <= 512,  "ff_dim out of range [4, 512]"
+        assert 1 <= self.num_layers   <= 6,    "num_layers out of range [1, 6]"
+        assert 4 <= self.max_seq_len  <= 64,   "max_seq_len out of range [4, 64]"
+        assert 1 <= self.think_steps  <= 8,    "think_steps out of range [1, 8]"
+        assert 1 <= self.memory_slots <= 16,   "memory_slots out of range [1, 16]"
+
+    @property
+    def head_dim(self) -> int:
+        return self.embed_dim // self.num_heads
+
+    def param_count(self) -> int:
+        """Rough estimate of total float parameters."""
+        E, V, L, F, S, MS = (self.embed_dim, self.vocab_size, self.num_layers,
+                              self.ff_dim, self.max_seq_len, self.memory_slots)
+        p  = V * E + S * E                 # embeddings
+        p += L * (4 * E * E + 2 * E)      # attn weights + LN
+        p += L * (E * F + F + F * E + E + 2 * E)  # FF + LN
+        p += E * E + E + 2 * E            # reasoning + LN
+        p += MS * E + E * MS + MS * E     # memory
+        p += E * V + V                    # output
+        return p
+
+
+# ── Locate the shared library ─────────────────────────────────────────────────
 
 def _find_library(name: str) -> str:
-    """Search for the compiled shared library next to this script or in CWD."""
     here = Path(__file__).parent.resolve()
     cwd  = Path.cwd()
 
     if platform.system() == "Windows":
-        exts = [".dll"]
-        prefixes = ["", "lib"]
+        exts, prefixes = [".dll"], ["", "lib"]
     elif platform.system() == "Darwin":
-        exts = [".dylib", ".so"]
-        prefixes = ["lib", ""]
+        exts, prefixes = [".dylib", ".so"], ["lib", ""]
     else:
-        exts = [".so"]
-        prefixes = ["lib", ""]
+        exts, prefixes = [".so"], ["lib", ""]
 
     candidates = []
     for base in [here, cwd, here / "build", cwd / "build"]:
@@ -80,24 +135,29 @@ def _find_library(name: str) -> str:
 
     raise FileNotFoundError(
         f"Cannot find '{name}' shared library.\n"
-        f"Searched:\n" + "\n".join(f"  {c}" for c in candidates) + "\n"
-        f"\nBuild it first:\n"
+        f"Searched:\n" + "\n".join(f"  {c}" for c in candidates) + "\n\n"
+        f"Build it first:\n"
         f"  Linux/macOS : gcc -O2 -shared -fPIC -o transformer.so transformer.c -lm\n"
         f"  Windows     : gcc -O2 -shared -fPIC -o transformer.dll transformer.c -lm\n"
     )
 
 
-# ── ctypes bridge ────────────────────────────────────────────────────────────
+# ── ctypes bridge ─────────────────────────────────────────────────────────────
 
 class _CLib:
-    """Low-level ctypes interface to the C transformer."""
-
     def __init__(self, lib_path: str):
         self._lib = ctypes.CDLL(lib_path)
         self._setup_signatures()
 
     def _setup_signatures(self):
         L = self._lib
+
+        # ── Configuration (NEW) ───────────────────────────────────────────
+        L.transformer_configure.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+        L.transformer_configure.restype = ctypes.c_int
 
         # ── Core ──────────────────────────────────────────────────────────
         L.transformer_init.argtypes = [ctypes.c_uint]
@@ -117,10 +177,8 @@ class _CLib:
         L.transformer_forward.restype = None
 
         L.transformer_generate.argtypes = [
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.c_int,
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int,
         ]
         L.transformer_generate.restype = ctypes.c_int
 
@@ -129,85 +187,137 @@ class _CLib:
 
         L.transformer_vocab_size.argtypes = []
         L.transformer_vocab_size.restype  = ctypes.c_int
-
         L.transformer_embed_dim.argtypes  = []
         L.transformer_embed_dim.restype   = ctypes.c_int
-
         L.transformer_max_seq.argtypes    = []
         L.transformer_max_seq.restype     = ctypes.c_int
-
         L.transformer_is_ready.argtypes   = []
         L.transformer_is_ready.restype    = ctypes.c_int
+        L.transformer_param_count.argtypes= []
+        L.transformer_param_count.restype = ctypes.c_int
 
-        # ── Training (new) ────────────────────────────────────────────────
+        # ── Training ──────────────────────────────────────────────────────
         L.transformer_adam_step.argtypes  = []
         L.transformer_adam_step.restype   = ctypes.c_longlong
 
-        # float transformer_cross_entropy_loss(tokens, seq_len, targets)
         L.transformer_cross_entropy_loss.argtypes = [
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int,
             ctypes.POINTER(ctypes.c_int),
         ]
         L.transformer_cross_entropy_loss.restype = ctypes.c_float
 
-        # void transformer_zero_grad(void)
         L.transformer_zero_grad.argtypes  = []
         L.transformer_zero_grad.restype   = None
 
-        # void transformer_backward(tokens, seq_len, targets, loss_out*)
         L.transformer_backward.argtypes = [
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int,
             ctypes.POINTER(ctypes.c_int),
             ctypes.POINTER(ctypes.c_float),
         ]
         L.transformer_backward.restype = None
 
-        # void transformer_step(float lr)
         L.transformer_step.argtypes = [ctypes.c_float]
         L.transformer_step.restype  = None
 
 
-# ── High-level Python class ──────────────────────────────────────────────────
+# ── High-level Python class ───────────────────────────────────────────────────
 
 class ThinkingTransformer:
     """
     High-level Python interface to the Thinking Transformer C backend.
 
-    Inference attributes
-    --------------------
-    vocab_size  : int   – vocabulary size
-    embed_dim   : int   – embedding / hidden dimension
-    max_seq_len : int   – maximum sequence length
+    Supports runtime configuration of all hyperparameters, full BPTT
+    training, and byte-level tokenisation for quick experiments.
 
-    Training
-    --------
-    train_step(tokens, targets, lr)   – zero_grad + backward + step, returns loss
-    compute_loss(tokens, targets)     – forward-only CE loss (no grad update)
+    Parameters
+    ----------
+    config    : TransformerConfig  – architecture specification
+    lib_path  : str | None         – explicit path to shared library
+
+    Example
+    -------
+    >>> from thinking_transformer import ThinkingTransformer, TransformerConfig
+    >>> cfg = TransformerConfig(vocab_size=128, embed_dim=64, num_heads=4,
+    ...                         ff_dim=128, num_layers=2, max_seq_len=32)
+    >>> model = ThinkingTransformer(config=cfg)
+    >>> model.init(seed=0)
+    >>> loss = model.train_step([4,5,6], [5,6,7], lr=1e-3)
     """
 
-    # Special token constants (mirror transformer.c)
+    # Special token constants
     TOK_PAD    = 0
     TOK_THINK  = 1
     TOK_PLAN   = 2
     TOK_VERIFY = 3
 
-    def __init__(self, lib_path: Optional[str] = None):
+    def __init__(
+        self,
+        config:   Optional[TransformerConfig] = None,
+        lib_path: Optional[str] = None,
+    ):
+        self.config = config or TransformerConfig()
+        self.config.validate()
+
         path = lib_path or _find_library("transformer")
         print(f"[ThinkingTransformer] Loading library: {path}")
         self._clib = _CLib(path)
 
-        self.vocab_size  = self._clib._lib.transformer_vocab_size()
-        self.embed_dim   = self._clib._lib.transformer_embed_dim()
-        self.max_seq_len = self._clib._lib.transformer_max_seq()
+        # Apply configuration to C backend
+        rc = self._clib._lib.transformer_configure(
+            self.config.vocab_size,
+            self.config.embed_dim,
+            self.config.num_heads,
+            self.config.ff_dim,
+            self.config.num_layers,
+            self.config.max_seq_len,
+            self.config.think_steps,
+            self.config.memory_slots,
+        )
+        if rc != 0:
+            raise ValueError(
+                "transformer_configure() rejected the configuration. "
+                "Check that embed_dim is divisible by num_heads and all "
+                "values are within supported ranges."
+            )
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────
+        # Sync Python-side properties from C backend
+        self._sync_properties()
+
+    def _sync_properties(self):
+        L = self._clib._lib
+        self.vocab_size  = L.transformer_vocab_size()
+        self.embed_dim   = L.transformer_embed_dim()
+        self.max_seq_len = L.transformer_max_seq()
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────
 
     def init(self, seed: int = 42) -> "ThinkingTransformer":
         """Randomly initialise all weights (also resets Adam state)."""
         self._clib._lib.transformer_init(ctypes.c_uint(seed))
+        self._sync_properties()
         print(f"[ThinkingTransformer] Weights initialised (seed={seed})")
+        return self
+
+    def configure(self, **kwargs) -> "ThinkingTransformer":
+        """
+        Update architecture configuration.
+        Must be called BEFORE init() / after load().
+
+        Keyword args mirror TransformerConfig fields.
+        """
+        for k, v in kwargs.items():
+            if not hasattr(self.config, k):
+                raise ValueError(f"Unknown config key: {k!r}")
+            setattr(self.config, k, v)
+        self.config.validate()
+        rc = self._clib._lib.transformer_configure(
+            self.config.vocab_size, self.config.embed_dim,
+            self.config.num_heads,  self.config.ff_dim,
+            self.config.num_layers, self.config.max_seq_len,
+            self.config.think_steps, self.config.memory_slots,
+        )
+        if rc != 0:
+            raise ValueError("transformer_configure() rejected updated config.")
         return self
 
     def save(self, path: str) -> None:
@@ -220,33 +330,36 @@ class ThinkingTransformer:
         rc = self._clib._lib.transformer_load(path.encode())
         if rc != 0:
             raise IOError(f"transformer_load failed (rc={rc})")
+        self._sync_properties()
         print(f"[ThinkingTransformer] Weights loaded ← {path}")
 
     def is_ready(self) -> bool:
         return bool(self._clib._lib.transformer_is_ready())
 
     def info(self) -> str:
-        buf = ctypes.create_string_buffer(512)
-        self._clib._lib.transformer_info(buf, 512)
+        buf = ctypes.create_string_buffer(1024)
+        self._clib._lib.transformer_info(buf, 1024)
         return buf.value.decode()
 
+    def param_count(self) -> int:
+        """Return the number of trainable float parameters."""
+        return int(self._clib._lib.transformer_param_count())
+
     def adam_step_count(self) -> int:
-        """Return the number of completed Adam optimizer steps."""
         return int(self._clib._lib.transformer_adam_step())
 
-    # ── Forward pass ──────────────────────────────────────────────────────
+    # ── Forward pass ───────────────────────────────────────────────────────
 
     def forward(self, tokens: List[int]) -> np.ndarray:
         """
         Run one full forward pass (with iterative thinking loop).
-
         Returns logits of shape (seq_len, vocab_size).
+        Also caches all activations for subsequent backward().
         """
         self._assert_ready()
         seq_len = len(tokens)
         if seq_len > self.max_seq_len:
             raise ValueError(f"Sequence too long ({seq_len} > {self.max_seq_len})")
-
         c_tokens = (ctypes.c_int   * seq_len)(*tokens)
         c_logits = (ctypes.c_float * (seq_len * self.vocab_size))()
         self._clib._lib.transformer_forward(c_tokens, seq_len, c_logits)
@@ -254,69 +367,45 @@ class ThinkingTransformer:
             seq_len, self.vocab_size).copy()
 
     def logprobs(self, tokens: List[int]) -> np.ndarray:
-        """Like forward() but returns log-softmax probabilities."""
         logits = self.forward(tokens)
         logits -= logits.max(axis=-1, keepdims=True)
         probs   = np.exp(logits)
         probs  /= probs.sum(axis=-1, keepdims=True)
         return np.log(probs + 1e-9)
 
-    # ── Training ──────────────────────────────────────────────────────────
+    # ── Training ───────────────────────────────────────────────────────────
 
-    def compute_loss(
-        self,
-        tokens:  List[int],
-        targets: List[int],
-    ) -> float:
-        """
-        Compute cross-entropy loss without updating weights.
-
-        Parameters
-        ----------
-        tokens  : input token ids  (length T)
-        targets : target token ids (length T), typically tokens shifted by 1
-
-        Returns
-        -------
-        float – mean cross-entropy loss
-        """
+    def compute_loss(self, tokens: List[int], targets: List[int]) -> float:
+        """Compute cross-entropy loss without updating weights."""
         self._assert_ready()
-        assert len(tokens) == len(targets), "tokens and targets must have the same length"
+        assert len(tokens) == len(targets)
         T = len(tokens)
         c_tok = (ctypes.c_int * T)(*tokens)
         c_tgt = (ctypes.c_int * T)(*targets)
         return float(self._clib._lib.transformer_cross_entropy_loss(c_tok, T, c_tgt))
 
     def zero_grad(self) -> None:
-        """Zero all accumulated gradients."""
         self._clib._lib.transformer_zero_grad()
 
-    def backward(
-        self,
-        tokens:  List[int],
-        targets: List[int],
-    ) -> float:
+    def backward(self, tokens: List[int], targets: List[int]) -> float:
         """
-        Run forward + backward pass; accumulate gradients into C buffer.
-
-        Returns the mean cross-entropy loss for this batch.
+        Run full forward + BPTT backward pass.
+        Gradients are accumulated into the C gradient buffer.
         Call zero_grad() before and step() after.
+
+        Returns the mean cross-entropy loss.
         """
         self._assert_ready()
-        assert len(tokens) == len(targets), "tokens and targets must have the same length"
+        assert len(tokens) == len(targets)
         T = len(tokens)
-        c_tok   = (ctypes.c_int   * T)(*tokens)
-        c_tgt   = (ctypes.c_int   * T)(*targets)
-        c_loss  = ctypes.c_float(0.0)
-        self._clib._lib.transformer_backward(c_tok, T, c_tgt,
-                                              ctypes.byref(c_loss))
+        c_tok  = (ctypes.c_int   * T)(*tokens)
+        c_tgt  = (ctypes.c_int   * T)(*targets)
+        c_loss = ctypes.c_float(0.0)
+        self._clib._lib.transformer_backward(c_tok, T, c_tgt, ctypes.byref(c_loss))
         return float(c_loss.value)
 
     def step(self, lr: float = 1e-3) -> None:
-        """
-        Apply one Adam optimizer step using accumulated gradients,
-        then zero the gradient buffer.
-        """
+        """Apply one Adam optimizer step, then zero gradients."""
         self._clib._lib.transformer_step(ctypes.c_float(lr))
 
     def train_step(
@@ -326,25 +415,45 @@ class ThinkingTransformer:
         lr:      float = 1e-3,
     ) -> float:
         """
-        Convenience method: zero_grad + backward + step.
-
-        Returns
-        -------
-        float – mean cross-entropy loss
+        Convenience method: zero_grad → full BPTT backward → Adam step.
+        Returns mean cross-entropy loss.
         """
         self.zero_grad()
         loss = self.backward(tokens, targets)
         self.step(lr)
         return loss
 
-    # ── Generation ────────────────────────────────────────────────────────
-
-    def generate(
+    def train_batch(
         self,
-        prompt: List[int],
-        max_new_tokens: int = 16,
-    ) -> List[int]:
-        """Greedy auto-regressive generation."""
+        batch:   List[Tuple[List[int], List[int]]],
+        lr:      float = 1e-3,
+    ) -> float:
+        """
+        Mini-batch training: accumulate gradients over all samples,
+        then take one Adam step. Returns mean loss.
+
+        Parameters
+        ----------
+        batch : list of (tokens, targets) pairs
+        lr    : learning rate
+        """
+        self._assert_ready()
+        self.zero_grad()
+        total_loss = 0.0
+        for tokens, targets in batch:
+            assert len(tokens) == len(targets)
+            T = len(tokens)
+            c_tok  = (ctypes.c_int   * T)(*tokens)
+            c_tgt  = (ctypes.c_int   * T)(*targets)
+            c_loss = ctypes.c_float(0.0)
+            self._clib._lib.transformer_backward(c_tok, T, c_tgt, ctypes.byref(c_loss))
+            total_loss += float(c_loss.value)
+        self.step(lr)
+        return total_loss / max(len(batch), 1)
+
+    # ── Generation ─────────────────────────────────────────────────────────
+
+    def generate(self, prompt: List[int], max_new_tokens: int = 16) -> List[int]:
         self._assert_ready()
         prompt_len = len(prompt)
         c_prompt   = (ctypes.c_int * prompt_len)(*prompt)
@@ -355,34 +464,24 @@ class ThinkingTransformer:
 
     def generate_with_thinking(
         self,
-        prompt: List[int],
-        max_new_tokens: int = 16,
-        verbose: bool = False,
+        prompt:         List[int],
+        max_new_tokens: int  = 16,
+        verbose:        bool = False,
     ) -> dict:
         """
-        Generate tokens and expose the think/plan/verify structure.
+        Wrap prompt with THINK/PLAN tokens and expose reasoning structure.
 
-        Wraps prompt as: [THINK] + prompt + [PLAN]
-
-        Returns
-        -------
-        dict:
-          'input_with_reasoning' : full token list fed to the model
-          'output_tokens'        : generated tokens
-          'logits'               : raw logits for the input sequence
-          'think_token_idx'      : index of <THINK> token (always 0)
-          'plan_token_idx'       : index of <PLAN> token
+        Returns dict with keys:
+          input_with_reasoning, output_tokens, logits,
+          think_token_idx, plan_token_idx
         """
         think_prompt = [self.TOK_THINK] + list(prompt) + [self.TOK_PLAN]
         if verbose:
             print(f"[ThinkingTransformer] Reasoning prompt: {think_prompt}")
-
         output = self.generate(think_prompt, max_new_tokens=max_new_tokens)
         logits = self.forward(think_prompt)
-
         if verbose:
             print(f"[ThinkingTransformer] Generated tokens: {output}")
-
         return {
             "input_with_reasoning": think_prompt,
             "output_tokens":        output,
@@ -391,19 +490,21 @@ class ThinkingTransformer:
             "plan_token_idx":       len(think_prompt) - 1,
         }
 
-    # ── Token utilities ───────────────────────────────────────────────────
+    # ── Token utilities ────────────────────────────────────────────────────
 
-    @staticmethod
-    def text_to_tokens(text: str, vocab_size: int = 64) -> List[int]:
-        """Trivial byte-level tokeniser (mod vocab_size)."""
-        return [b % vocab_size for b in text.encode("utf-8")]
+    def text_to_tokens(self, text: str) -> List[int]:
+        """Byte-level tokeniser — maps bytes mod vocab_size."""
+        return [b % self.vocab_size for b in text.encode("utf-8")]
 
-    @staticmethod
-    def tokens_to_text(tokens: List[int]) -> str:
-        """Best-effort bytes → string (demo only, not lossless)."""
+    def tokens_to_text(self, tokens: List[int]) -> str:
         return bytes(t % 256 for t in tokens).decode("utf-8", errors="replace")
 
-    # ── Internals ─────────────────────────────────────────────────────────
+    @staticmethod
+    def make_targets(tokens: List[int], pad: int = 0) -> List[int]:
+        """Shift tokens left by one for next-token prediction."""
+        return tokens[1:] + [pad]
+
+    # ── Internals ──────────────────────────────────────────────────────────
 
     def _assert_ready(self):
         if not self.is_ready():
@@ -414,50 +515,52 @@ class ThinkingTransformer:
     def __repr__(self) -> str:
         return (
             f"ThinkingTransformer("
-            f"vocab={self.vocab_size}, "
-            f"embed={self.embed_dim}, "
+            f"vocab={self.vocab_size}, embed={self.embed_dim}, "
+            f"heads={self.config.num_heads}, ff={self.config.ff_dim}, "
+            f"layers={self.config.num_layers}, "
+            f"think_steps={self.config.think_steps}, "
             f"max_seq={self.max_seq_len}, "
-            f"ready={self.is_ready()}, "
+            f"params={self.param_count() if self.is_ready() else '?'}, "
             f"adam_steps={self.adam_step_count()}"
             f")"
         )
 
 
-# ── Quick smoke-test ─────────────────────────────────────────────────────────
+# ── Quick smoke-test ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Thinking Transformer — Python Demo (with Training)")
+    print("  Thinking Transformer — Python Demo (Full BPTT)")
     print("=" * 60)
 
-    model = ThinkingTransformer()
+    cfg = TransformerConfig(
+        vocab_size=64, embed_dim=32, num_heads=4,
+        ff_dim=64, num_layers=2, max_seq_len=32,
+        think_steps=2, memory_slots=8,
+    )
+    model = ThinkingTransformer(config=cfg)
     model.init(seed=1337)
     print(f"Model : {model}")
     print(f"Info  : {model.info()}")
     print()
 
-    tokens = [5, 12, 3, 22, 7]
-    targets = tokens[1:] + [0]   # next-token targets
+    tokens  = [5, 12, 3, 22, 7]
+    targets = model.make_targets(tokens)
 
-    # Before training
     loss_before = model.compute_loss(tokens, targets)
     print(f"Loss before training : {loss_before:.4f}")
 
-    # 20 training steps
-    for step in range(20):
+    for step in range(30):
         loss = model.train_step(tokens, targets, lr=1e-3)
         if step % 5 == 0:
             print(f"  step {step:3d}  loss={loss:.4f}")
 
     loss_after = model.compute_loss(tokens, targets)
     print(f"Loss after  training : {loss_after:.4f}")
-    print()
 
-    # Generate
     generated = model.generate(tokens[:3], max_new_tokens=5)
     print(f"Generated : {generated}")
 
-    # Thinking generation
     result = model.generate_with_thinking(tokens[:3], max_new_tokens=5, verbose=True)
     print(f"Output    : {result['output_tokens']}")
     print()
