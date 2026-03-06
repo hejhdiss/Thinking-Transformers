@@ -22,6 +22,19 @@ Input Tokens → Embedding → [Transformer + Reasoning Loop × T] → Output
 
 ### Model Specifications
 
+Edit C code for another dimensions 
+Example:
+```
+#define VOCAB_SIZE      256     // Was 64
+#define EMBED_DIM       128     // Was 32
+#define NUM_HEADS        8      // Was 4 (128/8=16, so HEAD_DIM=16)
+#define FF_DIM          512     // Was 64
+#define MAX_SEQ_LEN     128     // Was 32
+#define NUM_LAYERS       4      // Was 2
+#define THINK_STEPS      4      // Was 3
+#define MEMORY_SLOTS    16      // Was 8
+```
+
 | Parameter | Value |
 |-----------|-------|
 | Vocabulary Size | 64 |
@@ -35,12 +48,14 @@ Input Tokens → Embedding → [Transformer + Reasoning Loop × T] → Output
 | Memory Slots | 8 |
 
 ## Project Structure
+
+```
 .
 ├── transformer.c          # Core C implementation (inference + training)
 ├── thinking_transformer.py # Python wrapper with ctypes
 ├── transformer.so         # Compiled shared library (Linux/macOS)
 └── transformer.dll        # Compiled shared library (Windows)
-
+```
 
 ## Compilation
 
